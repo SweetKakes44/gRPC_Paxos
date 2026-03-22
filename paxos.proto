@@ -1,0 +1,101 @@
+syntax = "proto3";
+
+package paxos.v1;
+
+option go_package = "paxos-grpc/gen/paxosv1;paxosv1";
+
+// Globally unique, totally ordered proposal identifier.
+//
+// Comparison rule (deterministic):
+// 1) higher sequence wins
+// 2) if sequence ties, lexicographically higher address wins
+//
+// All proposal comparisons in Paxos should use this ordering.
+message ProposalId {
+  // Monotonic counter chosen by a proposer.
+  uint64 sequence = 1;
+  // Stable proposer identity (for example, host:port).
+  string address = 2;
+}
+
+// Client -> node: ask this node (acting as proposer) to run a single-decree
+// Paxos round for this application value.
+message ProposeValueRequest {
+  // Value the client wants chosen.
+  string value = 1;
+}
+
+// Node -> client: successful request returns the value that is now chosen.
+// This may differ from the requested value if Paxos safety required preserving
+// a value that was already accepted/chosen.
+message ProposeValueResponse {
+  string decided_value = 1;
+}
+
+// Phase 1 (Prepare): proposer asks an acceptor for a promise not to accept
+// older proposal ids.
+message PrepareRequest {
+  // Proposal id the proposer wants to use for this attempt.
+  ProposalId proposal_id = 1;
+}
+
+// Acceptor response to Prepare.
+message PrepareResponse {
+  // True if the acceptor promises to reject future Accept requests with id
+  // lower than promised_id.
+  bool promised = 1;
+  // Acceptor's current highest promised proposal id (updated when promised=true).
+  // Proposer uses this to learn when it must retry with a higher id.
+  ProposalId promised_id = 2;
+
+  // True when the acceptor has previously accepted a proposal/value pair.
+  bool has_accepted = 3;
+  // Highest accepted proposal id on this acceptor; meaningful when
+  // has_accepted=true.
+  ProposalId accepted_id = 4;
+  // Value paired with accepted_id; meaningful when has_accepted=true.
+  string accepted_value = 5;
+}
+
+// Phase 2 (Accept): proposer asks acceptors to accept a specific value under
+// proposal_id. The proposer should send the value associated with the highest
+// accepted_id observed in Phase 1 (or its own value if none were accepted).
+message AcceptRequest {
+  ProposalId proposal_id = 1;
+  string value = 2;
+}
+
+// Acceptor response to Accept.
+message AcceptResponse {
+  // True if this acceptor accepted (proposal_id, value).
+  // False if it had already promised a higher id.
+  bool accepted = 1;
+  // Current highest promised id on this acceptor.
+  ProposalId promised_id = 2;
+}
+
+// Phase 3 (Decide/Learn): once proposer has a quorum of Accept successes,
+// it broadcasts the chosen value so peers can finalize local state.
+message DecideRequest {
+  // Proposal id associated with the chosen value.
+  ProposalId proposal_id = 1;
+  // Chosen value.
+  string value = 2;
+}
+
+// Acknowledgement of Decide delivery.
+// This does not affect safety; it is useful for liveness/observability.
+message DecideResponse {
+  bool acknowledged = 1;
+}
+
+service Paxos {
+  // Client-facing entrypoint that triggers one proposer attempt and returns
+  // the final chosen value for this decree.
+  rpc ProposeValue(ProposeValueRequest) returns (ProposeValueResponse);
+
+  // Node-to-node Paxos RPCs used by proposers/acceptors/learners.
+  rpc Prepare(PrepareRequest) returns (PrepareResponse);
+  rpc Accept(AcceptRequest) returns (AcceptResponse);
+  rpc Decide(DecideRequest) returns (DecideResponse);
+}
