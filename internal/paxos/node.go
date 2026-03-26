@@ -2,7 +2,10 @@ package paxos
 
 import (
 	"context"
+	"fmt"
+	"log"
 	"sync"
+	"time"
 
 	pb "paxos-grpc/gen/paxosv1"
 )
@@ -30,7 +33,7 @@ type Node struct {
 // NewNode initializes a node with its unique address.
 func NewNode(address string) *Node {
 	return &Node{
-		address: address,
+		address:      address,
 		nextSequence: 1,
 	}
 }
@@ -57,21 +60,23 @@ func (n *Node) ProposeValue(ctx context.Context, req *pb.ProposeValueRequest) (*
 	for {
 		// 1. Prepare Phase
 		proposalId := n.generateId()
-		
+
 		// Collect promises from self and other nodes
 		promises := n.sendPrepare(ctx, proposalId)
-		
+
 		if !n.hasQuorum(len(promises)) {
-			// Failed to get quorum, increment and retry
+			fmt.Printf("--> FAILED to get quorum (only %d/%d nodes). Retrying in 1s...\n", len(promises), len(n.nodes)+1)
+			time.Sleep(1 * time.Second) // Prevent a "hot loop" that freezes your terminal
 			continue
 		}
-
+		fmt.Printf("--> SUCCESS: Quorum reached with %d nodes. Moving to Phase 2 (Accept)\n", len(promises))
+		// ... rest of your code ...
 		// 2. Accept Phase
 		// Pick the value to propose:
 		// If any acceptor returned a previously accepted value, we MUST use the one with the highest ID.
 		valueToPropose := req.Value
 		var highestAcceptedId *pb.ProposalId
-		
+
 		for _, p := range promises {
 			if p.HasAccepted {
 				if CompareProposalIds(p.AcceptedId, highestAcceptedId) > 0 {
@@ -117,29 +122,42 @@ func (n *Node) sendPrepare(ctx context.Context, id *pb.ProposalId) []*pb.Prepare
 	var mu sync.Mutex
 	var wg sync.WaitGroup
 
-	// 1. Ask self (Acceptor role)
+	// 1. Ask self
 	res, _ := n.Prepare(ctx, &pb.PrepareRequest{ProposalId: id})
-	if res.Promised {
+	if res != nil && res.Promised {
 		responses = append(responses, res)
 	}
 
-	// 2. Ask other nodes
 	n.mu.Lock()
 	nodes := n.nodes
 	n.mu.Unlock()
 
 	for _, node := range nodes {
 		wg.Add(1)
+		// We pass the client 'p' into the goroutine
 		go func(p pb.PaxosClient) {
 			defer wg.Done()
-			resp, err := p.Prepare(ctx, &pb.PrepareRequest{ProposalId: id})
-			if err == nil && resp.Promised {
+
+			// Use MILLISECONDS so the network has time to respond
+			childCtx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
+			defer cancel()
+
+			resp, err := p.Prepare(childCtx, &pb.PrepareRequest{ProposalId: id})
+
+			if err != nil {
+				// This will show up in your Zellij pane for the dead node
+				fmt.Printf("--> [NETWORK ERROR] A node is unreachable: %v", err)
+				return
+			}
+
+			if resp != nil && resp.Promised {
 				mu.Lock()
 				responses = append(responses, resp)
 				mu.Unlock()
 			}
-		}(node)
+		}(node) // Pass the node client here
 	}
+
 	wg.Wait()
 	return responses
 }
@@ -151,11 +169,10 @@ func (n *Node) sendAccept(ctx context.Context, id *pb.ProposalId, value string) 
 
 	// 1. Ask self
 	res, _ := n.Accept(ctx, &pb.AcceptRequest{ProposalId: id, Value: value})
-	if res.Accepted {
+	if res != nil && res.Accepted {
 		responses = append(responses, res)
 	}
 
-	// 2. Ask other nodes
 	n.mu.Lock()
 	nodes := n.nodes
 	n.mu.Unlock()
@@ -164,8 +181,12 @@ func (n *Node) sendAccept(ctx context.Context, id *pb.ProposalId, value string) 
 		wg.Add(1)
 		go func(p pb.PaxosClient) {
 			defer wg.Done()
-			resp, err := p.Accept(ctx, &pb.AcceptRequest{ProposalId: id, Value: value})
-			if err == nil && resp.Accepted {
+
+			childCtx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
+			defer cancel()
+
+			resp, err := p.Accept(childCtx, &pb.AcceptRequest{ProposalId: id, Value: value})
+			if err == nil && resp != nil && resp.Accepted {
 				mu.Lock()
 				responses = append(responses, resp)
 				mu.Unlock()
@@ -193,9 +214,12 @@ func (n *Node) broadcastDecide(ctx context.Context, id *pb.ProposalId, value str
 }
 
 // CompareProposalIds returns:
-//  1 if a > b
+//
+//	1 if a > b
+//
 // -1 if a < b
-//  0 if a == b
+//
+//	0 if a == b
 //
 // Rule:
 // 1) higher sequence wins
@@ -245,7 +269,7 @@ func (n *Node) Prepare(ctx context.Context, req *pb.PrepareRequest) (*pb.Prepare
 	}
 
 	res.PromisedId = n.promisedId
-	
+
 	// If the acceptor has already accepted a value, it must return it to the proposer.
 	if n.acceptedId != nil {
 		res.HasAccepted = true
